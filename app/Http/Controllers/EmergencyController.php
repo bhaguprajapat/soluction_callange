@@ -2,18 +2,24 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\Alert;
 use App\Models\Emergency;
 use App\Services\AlertService;
 use App\Services\GeminiService;
+use App\Services\LocationIntelligenceService;
+use App\Services\TwilioService;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 
 class EmergencyController extends Controller
 {
     public function __construct(
         private readonly GeminiService $geminiService,
-        private readonly AlertService $alertService
+        private readonly AlertService $alertService,
+        private readonly LocationIntelligenceService $locationIntelligenceService,
+        private readonly TwilioService $twilioService
     ) {
     }
 
@@ -48,11 +54,27 @@ class EmergencyController extends Controller
             ], 429);
         }
 
+        $locationText = $validated['location_label']
+            ?? sprintf('%.5f, %.5f', $validated['latitude'], $validated['longitude']);
+        $locationIntel = $this->locationIntelligenceService->resolve(
+            (float) $validated['latitude'],
+            (float) $validated['longitude'],
+            $locationText
+        );
+        $mapsLink = (string) ($locationIntel['maps_link'] ?? sprintf(
+            'https://www.google.com/maps?q=%s,%s',
+            $validated['latitude'],
+            $validated['longitude']
+        ));
+        $locationText = (string) ($locationIntel['location_name'] ?? $locationText);
+
         $analysis = $this->geminiService->analyzeEmergency(
             $validated['type'],
             (float) $validated['latitude'],
             (float) $validated['longitude'],
-            $validated['location_label'] ?? null
+            $locationText,
+            $mapsLink,
+            $locationIntel
         );
 
         $emergency = Emergency::create([
@@ -71,15 +93,21 @@ class EmergencyController extends Controller
             $analysis['severity'] = 'critical';
             $analysis['message'] = 'CRITICAL CLUSTER EVENT: '.$analysis['message'];
             $analysis['cluster_event'] = true;
-            $emergency->update([
-                'severity' => 'critical',
-                'ai_response' => $analysis,
-            ]);
         }
 
-        $locationText = $validated['location_label']
-            ?? sprintf('%.5f, %.5f', $validated['latitude'], $validated['longitude']);
+        $analysis['message'] = $this->composeLocationMessage($analysis['message'], $mapsLink);
+        $analysis['maps_link'] = $mapsLink;
+        $analysis['location'] = $locationText;
+        $analysis['pincode'] = $locationIntel['pincode'] ?? null;
+        $analysis['nearest_police_station'] = $locationIntel['nearest_police_station'] ?? null;
+
         $voiceMessage = $this->geminiService->generateVoiceAlertMessage($validated['type'], $locationText);
+        $analysis['voice_message'] = $voiceMessage;
+
+        $emergency->update([
+            'severity' => $analysis['severity'],
+            'ai_response' => $analysis,
+        ]);
 
         $this->alertService->dispatchAlerts(
             $emergency,
@@ -88,6 +116,7 @@ class EmergencyController extends Controller
             $voiceMessage,
             $clusterActive
         );
+        $this->notifyComplainant($request, $emergency);
 
         return response()->json([
             'message' => 'Emergency triggered successfully.',
@@ -112,5 +141,59 @@ class EmergencyController extends Controller
             ->count();
 
         return $count > 3;
+    }
+
+    private function composeLocationMessage(string $message, string $mapsLink): string
+    {
+        return trim($message)."\n\nLocation:\n{$mapsLink}\nImmediate response required.";
+    }
+
+    private function notifyComplainant(Request $request, Emergency $emergency): void
+    {
+        $user = $request->user();
+        if (! $user || empty($user->phone)) {
+            return;
+        }
+
+        $status = $this->twilioService->sendSms(
+            $user->phone,
+            'Your emergency has been reported successfully. Help is on the way.'
+        );
+
+        try {
+            $callResult = $this->twilioService->makeCall(
+                $user->phone,
+                'Emergency alert received. Help is being dispatched immediately.'
+            );
+
+            Log::info('Emergency complainant voice call result', [
+                'emergency_id' => $emergency->id,
+                'user_id' => $user->id,
+                'success' => (bool) ($callResult['success'] ?? false),
+                'sid' => $callResult['sid'] ?? null,
+                'error' => $callResult['error'] ?? null,
+            ]);
+
+            if (! ($callResult['success'] ?? false)) {
+                Log::warning('Emergency complainant voice call failed but flow continues', [
+                    'emergency_id' => $emergency->id,
+                    'user_id' => $user->id,
+                    'error' => $callResult['error'] ?? 'Unknown Twilio voice error',
+                ]);
+            }
+        } catch (\Throwable $e) {
+            Log::error('Emergency complainant voice call exception (flow continues)', [
+                'emergency_id' => $emergency->id,
+                'user_id' => $user->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        Alert::create([
+            'emergency_id' => $emergency->id,
+            'user_id' => $user->id,
+            'alert_type' => 'sms',
+            'status' => $status ? 'sent' : 'failed',
+        ]);
     }
 }

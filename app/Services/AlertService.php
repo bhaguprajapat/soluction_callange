@@ -26,7 +26,7 @@ class AlertService
             ->whereIn('role', $responders)
             ->get();
 
-        $twilioResults = $this->twilioService->dispatchEmergencyBroadcast($targets, $message, $voiceMessage);
+        $twilioResults = $this->twilioService->dispatchEmergencyBroadcast($emergency, $targets, $message, $voiceMessage);
 
         foreach ($targets as $target) {
             $this->createAlert($emergency, $target, 'dashboard', 'sent');

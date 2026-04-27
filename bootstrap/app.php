@@ -16,6 +16,13 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->alias([
             'phone.verified' => EnsurePhoneVerified::class,
         ]);
+
+        $middleware->validateCsrfTokens(except: [
+            'twilio/voice',
+            'twilio/handle',
+            'twilio/voice/ivr',
+            'handle-response',
+        ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         //

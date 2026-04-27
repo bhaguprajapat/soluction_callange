@@ -50,9 +50,10 @@ return [
     'twilio' => [
         'account_sid' => env('TWILIO_ACCOUNT_SID', env('TWILIO_SID')),
         'auth_token' => env('TWILIO_AUTH_TOKEN', env('TWILIO_TOKEN')),
-        'sms_from' => env('TWILIO_SMS_FROM', env('TWILIO_PHONE_NUMBER')),
+        'sms_from' => env('TWILIO_SMS_FROM', env('TWILIO_PHONE_NUMBER', env('TWILIO_FROM'))),
         'whatsapp_from' => env('TWILIO_WHATSAPP_FROM'),
-        'voice_from' => env('TWILIO_VOICE_FROM'),
+        'voice_from' => env('TWILIO_VOICE_FROM', env('TWILIO_FROM')),
+        'voice_webhook_url' => env('TWILIO_VOICE_WEBHOOK_URL'),
     ],
 
     'maps' => [

@@ -37,4 +37,9 @@ class Emergency extends Model
     {
         return $this->hasMany(Alert::class);
     }
+
+    public function responderActions(): HasMany
+    {
+        return $this->hasMany(ResponderAction::class);
+    }
 }

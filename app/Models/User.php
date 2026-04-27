@@ -72,6 +72,11 @@ class User extends Authenticatable
         return $this->hasMany(Otp::class);
     }
 
+    public function responderActions(): HasMany
+    {
+        return $this->hasMany(ResponderAction::class, 'responder_id');
+    }
+
     public function hasVerifiedPhone(): bool
     {
         return ! is_null($this->phone) && ! is_null($this->phone_verified_at);
