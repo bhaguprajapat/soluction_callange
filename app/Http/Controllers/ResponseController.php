@@ -2,14 +2,13 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\Alert;
 use App\Models\Emergency;
-use App\Models\ResponderAction;
 use App\Models\User;
 use App\Services\GeminiService;
 use App\Services\TwilioService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Twilio\TwiML\VoiceResponse;
 
@@ -23,197 +22,143 @@ class ResponseController extends Controller
 
     public function voiceWebhook(Request $request)
     {
-        $attempt = max(0, (int) $request->input('attempt', 0));
-
         $emergency = $this->resolveEmergency($request);
         $responder = $this->resolveResponder($request);
+        $toPhone = $this->normalizePhone((string) $request->input('To', $responder?->phone ?? ''));
+        $language = $this->resolveCallLanguage($toPhone);
 
         Log::info('Twilio voice webhook hit', [
             'emergency_id' => $emergency?->id,
             'responder_id' => $responder?->id,
-            'attempt' => $attempt,
-            'to' => $request->input('To'),
+            'to' => $toPhone,
             'from' => $request->input('From'),
             'call_sid' => $request->input('CallSid'),
+            'language' => $language,
         ]);
 
         $voice = new VoiceResponse();
 
         if (! $emergency) {
-            $voice->say('Emergency call center is active. Press 1 for Hindi or 2 for English.');
+            $voice->say('Is samay mere paas itni hi jaankari uplabdh hai', ['voice' => 'alice']);
+            $voice->say('Dhanyavaad, kripya turant action lein', ['voice' => 'alice']);
             $voice->hangup();
 
             return $this->asTwiml($voice);
         }
 
+        $context = $this->emergencyContext($emergency);
+        $intro = $this->geminiService->generateEmergencyOperatorOpening($context, $language);
+
+        $callSid = (string) $request->input('CallSid', '');
+        $this->storeConversation($callSid, []);
+
+        $voice->say($intro, ['voice' => 'alice']);
+
         $gather = $voice->gather([
-            'numDigits' => 1,
+            'input' => 'speech',
+            'speechTimeout' => 'auto',
+            'timeout' => 6,
             'action' => $this->buildHandleResponseUrl(
                 $request,
                 $emergency->id,
                 $responder?->id ?? 0,
-                'language',
-                'en',
-                0
+                $language,
+                1
             ),
             'method' => 'POST',
-            'timeout' => 7,
         ]);
 
-        $gather->say('Emergency alert received. Press 1 for Hindi. Press 2 for English.', ['voice' => 'alice']);
+        $gather->say($this->nextQuestionPrompt($language), ['voice' => 'alice']);
 
-        if ($attempt < 1) {
-            $voice->say('No input received. Trying once more.');
-            $voice->redirect($this->buildVoiceIntroUrl($request, $emergency->id, $responder?->id ?? 0, $attempt + 1), [
-                'method' => 'POST',
-            ]);
-        } else {
-            $voice->say('No input received. Goodbye.');
-            $voice->hangup();
-        }
+        $voice->say('Is samay mere paas itni hi jaankari uplabdh hai', ['voice' => 'alice']);
+        $voice->say($this->closingLine($language), ['voice' => 'alice']);
+        $voice->hangup();
 
         return $this->asTwiml($voice);
     }
 
     public function handleVoice(Request $request)
     {
-        $phase = (string) $request->input('phase', 'language');
-        $language = (string) $request->input('lang', 'en');
-        $round = max(0, (int) $request->input('round', 0));
-        $digit = (string) $request->input('Digits', '');
+        $language = strtolower((string) $request->input('lang', 'hi')) === 'hi' ? 'hi' : 'en';
+        $round = max(1, (int) $request->input('round', 1));
         $speech = trim((string) $request->input('SpeechResult', ''));
+        $callSid = (string) $request->input('CallSid', '');
 
         $emergency = $this->resolveEmergency($request);
         $responder = $this->resolveResponder($request);
 
-        Log::info('Twilio handle callback', [
-            'phase' => $phase,
-            'digit' => $digit,
-            'speech' => $speech,
+        Log::info('Twilio speech callback', [
             'lang' => $language,
             'round' => $round,
+            'speech' => $speech,
             'emergency_id' => $emergency?->id,
             'responder_id' => $responder?->id,
-            'call_sid' => $request->input('CallSid'),
+            'call_sid' => $callSid,
         ]);
 
         $voice = new VoiceResponse();
+
         if (! $emergency) {
-            $voice->say('Emergency context unavailable. Goodbye.');
+            $voice->say('Is samay mere paas itni hi jaankari uplabdh hai', ['voice' => 'alice']);
+            $voice->say($this->closingLine($language), ['voice' => 'alice']);
             $voice->hangup();
 
             return $this->asTwiml($voice);
         }
 
-        if ($phase === 'language') {
-            $language = $digit === '1' ? 'hi' : 'en';
-
-            $context = $this->emergencyContext($emergency);
-            $intro = $this->geminiService->generateResponderIvrMessage(
-                $emergency->type,
-                $emergency->severity,
-                $context['location_name'],
-                $context['maps_link'],
-                $language
-            );
-
-            $voice->say($intro, ['voice' => 'alice']);
-            $gather = $voice->gather([
-                'input' => 'speech dtmf',
-                'numDigits' => 1,
-                'speechTimeout' => 'auto',
-                'action' => $this->buildHandleResponseUrl(
-                    $request,
-                    $emergency->id,
-                    $responder?->id ?? 0,
-                    'qa',
-                    $language,
-                    0
-                ),
-                'method' => 'POST',
-                'timeout' => 7,
-            ]);
-
-            if ($language === 'hi') {
-                $gather->say('Sawaal poochiye ya keypad ka upyog kijiye. Response dene ke liye 9 dabaiye.');
-            } else {
-                $gather->say('Ask your question or use keypad. Press 9 if you are responding.');
-            }
-            $voice->say($language === 'hi' ? 'Koi input nahin mila. Dhanyavaad.' : 'No input received. Thank you.');
+        if ($speech === '') {
+            $voice->say('Is samay mere paas itni hi jaankari uplabdh hai', ['voice' => 'alice']);
+            $voice->say($this->closingLine($language), ['voice' => 'alice']);
             $voice->hangup();
 
             return $this->asTwiml($voice);
         }
 
-        if ($phase === 'qa') {
-            if ($digit === '9' && $responder) {
-                $this->markResponderAccepted($emergency, $responder);
+        $context = $this->emergencyContext($emergency);
+        $history = $this->loadConversation($callSid);
 
-                $voice->say(
-                    $language === 'hi'
-                        ? 'Dhanyavaad. Aapko responding mark kar diya gaya hai.'
-                        : 'Thank you. You are marked as responding.'
-                );
-                $voice->hangup();
+        $answer = $this->geminiService->generateEmergencyOperatorAnswer(
+            $context,
+            $speech,
+            $language,
+            $history
+        );
 
-                return $this->asTwiml($voice);
-            }
+        $this->storeConversation(
+            $callSid,
+            array_slice(array_merge($history, [[
+                'q' => $speech,
+                'a' => $answer,
+            ]]), -6)
+        );
 
-            $question = $speech !== '' ? $speech : $this->mapDigitToQuestion($digit, $language);
-            if ($question === '') {
-                $question = $language === 'hi'
-                    ? 'Emergency ki current sthiti kya hai?'
-                    : 'What is the current emergency status?';
-            }
+        $voice->say($answer, ['voice' => 'alice']);
 
-            $context = $this->emergencyContext($emergency);
-            $answer = $this->geminiService->answerEmergencyQuery(
-                $question,
-                $emergency->type,
-                $emergency->severity,
-                $context['location_name'],
-                $context['pincode'],
-                $context['nearest_police_station'],
-                $context['maps_link'],
-                $language
-            );
-
-            $voice->say($answer, ['voice' => 'alice']);
-
-            if ($round < 1) {
-                $gather = $voice->gather([
-                    'input' => 'speech dtmf',
-                    'numDigits' => 1,
-                    'speechTimeout' => 'auto',
-                    'action' => $this->buildHandleResponseUrl(
-                        $request,
-                        $emergency->id,
-                        $responder?->id ?? 0,
-                        'qa',
-                        $language,
-                        $round + 1
-                    ),
-                    'method' => 'POST',
-                    'timeout' => 7,
-                ]);
-                $gather->say(
-                    $language === 'hi'
-                        ? 'Agar aur jaankari chahiye to sawaal poochiye. Respond karne ke liye 9 dabaiye.'
-                        : 'If you need more details, ask now. Press 9 to confirm response.'
-                );
-                $voice->say($language === 'hi' ? 'Koi input nahin mila. Call samaapt.' : 'No input received. Ending the call.');
-                $voice->hangup();
-
-                return $this->asTwiml($voice);
-            }
-
-            $voice->say($language === 'hi' ? 'Dhanyavaad. Call samaapt.' : 'Thank you. Ending the call.');
+        if ($round >= 3) {
+            $voice->say($this->closingLine($language), ['voice' => 'alice']);
             $voice->hangup();
 
             return $this->asTwiml($voice);
         }
 
-        $voice->say('Invalid IVR state. Goodbye.');
+        $gather = $voice->gather([
+            'input' => 'speech',
+            'speechTimeout' => 'auto',
+            'timeout' => 6,
+            'action' => $this->buildHandleResponseUrl(
+                $request,
+                $emergency->id,
+                $responder?->id ?? 0,
+                $language,
+                $round + 1
+            ),
+            'method' => 'POST',
+        ]);
+
+        $gather->say($this->nextQuestionPrompt($language), ['voice' => 'alice']);
+
+        $voice->say('Is samay mere paas itni hi jaankari uplabdh hai', ['voice' => 'alice']);
+        $voice->say($this->closingLine($language), ['voice' => 'alice']);
         $voice->hangup();
 
         return $this->asTwiml($voice);
@@ -286,80 +231,39 @@ class ResponseController extends Controller
     private function emergencyContext(Emergency $emergency): array
     {
         return [
+            'emergency_id' => $emergency->id,
+            'emergency_type' => (string) $emergency->type,
+            'severity' => (string) $emergency->severity,
             'location_name' => (string) data_get(
                 $emergency->ai_response,
                 'location',
                 $emergency->location_label ?: sprintf('%.5f, %.5f', $emergency->latitude, $emergency->longitude)
             ),
-            'maps_link' => (string) data_get(
+            'area_road' => (string) data_get(
                 $emergency->ai_response,
-                'maps_link',
-                sprintf('https://www.google.com/maps?q=%s,%s', $emergency->latitude, $emergency->longitude)
+                'area_road',
+                data_get($emergency->ai_response, 'area', data_get($emergency->ai_response, 'road', ''))
             ),
             'pincode' => data_get($emergency->ai_response, 'pincode'),
             'nearest_police_station' => data_get($emergency->ai_response, 'nearest_police_station'),
         ];
     }
 
-    private function markResponderAccepted(Emergency $emergency, User $responder): void
+    private function resolveCallLanguage(string $phone): string
     {
-        $action = ResponderAction::query()->firstOrNew([
-            'emergency_id' => $emergency->id,
-            'responder_id' => $responder->id,
-        ]);
-        $alreadyAccepted = $action->exists && $action->status === 'accepted';
-
-        $action->status = 'accepted';
-        if (! $action->exists) {
-            $action->created_at = now();
-        }
-        $action->save();
-
-        if ($alreadyAccepted) {
-            return;
-        }
-
-        $acceptedCount = ResponderAction::query()
-            ->where('emergency_id', $emergency->id)
-            ->where('status', 'accepted')
-            ->count();
-
-        $message = $acceptedCount === 1
-            ? 'Help is on the way: '.ucfirst((string) $responder->role).' is responding to your emergency.'
-            : "Help is on the way: {$acceptedCount} responders are on the way.";
-
-        if (! empty($emergency->user?->phone)) {
-            $status = $this->twilioService->sendSms($emergency->user->phone, $message);
-            Alert::create([
-                'emergency_id' => $emergency->id,
-                'user_id' => $emergency->user->id,
-                'alert_type' => 'sms',
-                'status' => $status ? 'sent' : 'failed',
-            ]);
-        }
-    }
-
-    private function buildVoiceIntroUrl(Request $request, int $emergencyId, int $responderId, int $attempt): string
-    {
-        return $this->callbackBaseUrl($request).'/twilio/voice?'.http_build_query([
-            'emergency_id' => $emergencyId,
-            'responder_id' => $responderId,
-            'attempt' => $attempt,
-        ]);
+        return str_starts_with($phone, '+91') ? 'hi' : 'en';
     }
 
     private function buildHandleResponseUrl(
         Request $request,
         int $emergencyId,
         int $responderId,
-        string $phase,
         string $language,
         int $round
     ): string {
         return $this->callbackBaseUrl($request).'/twilio/handle?'.http_build_query([
             'emergency_id' => $emergencyId,
             'responder_id' => $responderId,
-            'phase' => $phase,
             'lang' => $language,
             'round' => $round,
         ]);
@@ -372,16 +276,7 @@ class ResponseController extends Controller
             return $configured;
         }
 
-        if ($configured !== '') {
-            Log::warning('Ignoring non-public Twilio voice webhook base URL', [
-                'configured' => $configured,
-            ]);
-        }
-
         $requestHost = rtrim($request->getSchemeAndHttpHost(), '/');
-        if ($this->isPublicHttpUrl($requestHost)) {
-            return $requestHost;
-        }
 
         return $requestHost;
     }
@@ -403,31 +298,52 @@ class ResponseController extends Controller
         return ! in_array($host, ['localhost', '127.0.0.1', '::1'], true);
     }
 
-    private function mapDigitToQuestion(string $digit, string $language): string
+    private function nextQuestionPrompt(string $language): string
     {
-        if ($digit === '') {
-            return '';
+        if ($language === 'hi') {
+            return 'Kripya apna agla sawaal boliye.';
         }
 
-        return match ($digit) {
-            '1' => $language === 'hi'
-                ? 'Yahaan kya hua hai?'
-                : 'What happened at the location?',
-            '2' => $language === 'hi'
-                ? 'Exact location aur pincode kya hai?'
-                : 'What is the exact location and pincode?',
-            '3' => $language === 'hi'
-                ? 'Nearest police station kaunsa hai?'
-                : 'Which is the nearest police station?',
-            default => '',
-        };
+        return 'Please ask your next question.';
+    }
+
+    private function closingLine(string $language): string
+    {
+        if ($language === 'hi') {
+            return 'Dhanyavaad, kripya turant action lein';
+        }
+
+        return 'Thank you, please take immediate action.';
     }
 
     private function normalizePhone(string $phone): string
     {
-        $phone = preg_replace('/\s+/', '', $phone) ?: '';
+        return preg_replace('/\s+/', '', $phone) ?: '';
+    }
 
-        return $phone;
+    private function cacheKey(string $callSid): string
+    {
+        return 'twilio:voice:conversation:'.($callSid !== '' ? $callSid : 'unknown');
+    }
+
+    private function loadConversation(string $callSid): array
+    {
+        if ($callSid === '') {
+            return [];
+        }
+
+        $data = Cache::get($this->cacheKey($callSid), []);
+
+        return is_array($data) ? $data : [];
+    }
+
+    private function storeConversation(string $callSid, array $conversation): void
+    {
+        if ($callSid === '') {
+            return;
+        }
+
+        Cache::put($this->cacheKey($callSid), $conversation, now()->addMinutes(20));
     }
 
     private function asTwiml(VoiceResponse $voice)
